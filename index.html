@@ -99,6 +99,7 @@
       const finishLockRef = useRef(false);
       const highScoreRef = useRef(0);
       const scoreRef = useRef(0);
+      const activeTouchIdsRef = useRef(new Set());
 
       const LOCAL_HIGH_KEY = `${appId}:highScore`;
       const LOCAL_HISTORY_KEY = `${appId}:history`;
@@ -277,19 +278,7 @@
         return [...LEVELS].reverse().find(l => score >= l.min) || LEVELS[0];
       }, [score]);
 
-      const onTap = useCallback((e) => {
-        if (gameState !== 'playing') return;
-        if (e.cancelable) e.preventDefault();
-
-        setScore(s => s + 1);
-        const now = Date.now();
-        setCombo(prev => (now - lastTapTime < 250 ? prev + 1 : 1));
-        setLastTapTime(now);
-
-        const rect = e.currentTarget.getBoundingClientRect();
-        const x = e.clientX || e.touches?.[0]?.clientX || rect.left + rect.width / 2;
-        const y = e.clientY || e.touches?.[0]?.clientY || rect.top + rect.height / 2;
-
+      const spawnTapEffect = useCallback((x, y) => {
         const pCount = Math.min(4 + Math.floor(score / 80), 16);
         const newParticles = Array.from({ length: pCount }).map(() => ({
           id: Math.random(),
@@ -300,7 +289,49 @@
           size: Math.random() * 12 + 2
         }));
         setParticles(p => [...p.slice(-60), ...newParticles]);
-      }, [gameState, lastTapTime, score, currentLevel]);
+      }, [score, currentLevel]);
+
+      const registerTapAtPoint = useCallback((x, y) => {
+        if (gameState !== 'playing') return;
+        const now = Date.now();
+        setScore(s => s + 1);
+        setCombo(prev => (now - lastTapTime < 250 ? prev + 1 : 1));
+        setLastTapTime(now);
+        spawnTapEffect(x, y);
+      }, [gameState, lastTapTime, spawnTapEffect]);
+
+      const onTap = useCallback((e) => {
+        if (gameState !== 'playing') return;
+        if (e.cancelable) e.preventDefault();
+
+        const rect = e.currentTarget.getBoundingClientRect();
+        const x = e.clientX || rect.left + rect.width / 2;
+        const y = e.clientY || rect.top + rect.height / 2;
+        registerTapAtPoint(x, y);
+      }, [gameState, registerTapAtPoint]);
+
+      const onTouchStartTap = useCallback((e) => {
+        if (gameState !== 'playing') return;
+        if (e.cancelable) e.preventDefault();
+
+        for (const touch of Array.from(e.changedTouches || [])) {
+          if (activeTouchIdsRef.current.has(touch.identifier)) continue;
+          activeTouchIdsRef.current.add(touch.identifier);
+          registerTapAtPoint(touch.clientX, touch.clientY);
+        }
+      }, [gameState, registerTapAtPoint]);
+
+      const onTouchEndTap = useCallback((e) => {
+        for (const touch of Array.from(e.changedTouches || [])) {
+          activeTouchIdsRef.current.delete(touch.identifier);
+        }
+      }, []);
+
+      const onTouchCancelTap = useCallback((e) => {
+        for (const touch of Array.from(e.changedTouches || [])) {
+          activeTouchIdsRef.current.delete(touch.identifier);
+        }
+      }, []);
 
       const shake = gameState === 'playing' ? Math.min(combo / 6, 12) : 0;
 
@@ -370,7 +401,11 @@
 
               {gameState === 'playing' && (
                 <div onPointerDown={onTap}
-                    className="w-[88vw] h-[88vw] max-w-[400px] max-h-[400px] rounded-full border-[20px] border-white/10 flex items-center justify-center transition-all active:scale-90 bg-zinc-900/50 backdrop-blur-sm relative">
+                    onTouchStart={onTouchStartTap}
+                    onTouchEnd={onTouchEndTap}
+                    onTouchCancel={onTouchCancelTap}
+                    className="w-[88vw] h-[88vw] max-w-[400px] max-h-[400px] rounded-full border-[20px] border-white/10 flex items-center justify-center transition-all active:scale-90 bg-zinc-900/50 backdrop-blur-sm relative"
+                    style={{ touchAction: 'none' }}>
                   <div className={`absolute inset-0 rounded-full border-4 border-white/5 ${score > 400 ? 'animate-spin-fast' : 'animate-spin-slow'}`} />
                   <p className="text-9xl font-black italic tracking-tighter text-white drop-shadow-2xl">TAP!</p>
                 </div>
@@ -439,6 +474,14 @@
                     </div>
                   );
                 })}
+              </div>
+              <div className="pt-4 flex gap-4">
+                <button
+                  onPointerDown={() => { setShowHistory(false); setScore(0); setTimeLeft(30.0); setCountdown(3); setGameState('idle'); }}
+                  className="flex-1 bg-white text-black font-black py-6 rounded-[2rem] text-2xl active:scale-95 transition-all shadow-[0_0_50px_rgba(255,255,255,0.3)]"
+                >
+                  RESTART
+                </button>
               </div>
             </div>
           )}
