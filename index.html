@@ -78,7 +78,7 @@
       return displayValue;
     }
 
-    export default function App() {
+    function App() {
       const [user, setUser] = useState(null);
       const [score, setScore] = useState(0);
       const [highScore, setHighScore] = useState(0);
@@ -90,7 +90,6 @@
       const [isLocked, setIsLocked] = useState(false);
 
       const [particles, setParticles] = useState([]);
-      const [lastTapTime, setLastTapTime] = useState(0);
       const [combo, setCombo] = useState(0);
 
       const smoothScore = Math.round(useSmoothValue(score));
@@ -100,12 +99,21 @@
       const highScoreRef = useRef(0);
       const scoreRef = useRef(0);
       const activeTouchIdsRef = useRef(new Set());
+      const lastTapTimeRef = useRef(0);
+      const touchHandledRef = useRef(false);
+      const particleCleanupRef = useRef(null);
 
       const LOCAL_HIGH_KEY = `${appId}:highScore`;
       const LOCAL_HISTORY_KEY = `${appId}:history`;
 
       useEffect(() => { highScoreRef.current = highScore; }, [highScore]);
       useEffect(() => { scoreRef.current = score; }, [score]);
+
+      useEffect(() => {
+        return () => {
+          if (particleCleanupRef.current) clearTimeout(particleCleanupRef.current);
+        };
+      }, []);
 
       const readLocalRecords = useCallback(() => {
         try {
@@ -124,24 +132,22 @@
         const nowMs = Date.now();
         const { localHigh, localHistory } = readLocalRecords();
         const nextHigh = Math.max(localHigh, nextScore);
-        const nextHistory = [
-          { score: nextScore, timestampMs: nowMs },
-          ...localHistory
-        ].slice(0, 15);
+        const nextHistory = [{ score: nextScore, timestampMs: nowMs }, ...localHistory].slice(0, 15);
 
-        localStorage.setItem(LOCAL_HIGH_KEY, String(nextHigh));
-        localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(nextHistory));
+        try {
+          localStorage.setItem(LOCAL_HIGH_KEY, String(nextHigh));
+          localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(nextHistory));
+        } catch (e) {}
 
         setHighScore(prev => Math.max(prev, nextHigh));
         setHistory(prev => {
-          const normalizedPrev = prev
-            .map(h => {
-              if (h && h.timestamp && typeof h.timestamp.seconds === 'number') return h;
-              if (h && typeof h.timestampMs === 'number') {
-                return { ...h, timestamp: { seconds: Math.floor(h.timestampMs / 1000) } };
-              }
-              return h;
-            });
+          const normalizedPrev = prev.map(h => {
+            if (h && h.timestamp && typeof h.timestamp.seconds === 'number') return h;
+            if (h && typeof h.timestampMs === 'number') {
+              return { ...h, timestamp: { seconds: Math.floor(h.timestampMs / 1000) } };
+            }
+            return h;
+          });
           const merged = [
             { id: `local-${nowMs}`, score: nextScore, timestamp: { seconds: Math.floor(nowMs / 1000) }, timestampMs: nowMs },
             ...normalizedPrev
@@ -160,15 +166,17 @@
         const { localHigh, localHistory } = readLocalRecords();
         if (localHigh) setHighScore(localHigh);
         if (localHistory.length) {
-          setHistory(localHistory
-            .map((h, i) => ({
-              id: `boot-${h.timestampMs || i}`,
-              score: h.score,
-              timestamp: { seconds: Math.floor((h.timestampMs || Date.now()) / 1000) },
-              timestampMs: h.timestampMs
-            }))
-            .sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0))
-            .slice(0, 15));
+          setHistory(
+            localHistory
+              .map((h, i) => ({
+                id: `boot-${h.timestampMs || i}`,
+                score: h.score,
+                timestamp: { seconds: Math.floor((h.timestampMs || Date.now()) / 1000) },
+                timestampMs: h.timestampMs
+              }))
+              .sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0))
+              .slice(0, 15)
+          );
         }
       }, [readLocalRecords]);
 
@@ -191,10 +199,7 @@
         if (!db || !user) return;
         const scoreDocRef = db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('stats').doc('overall');
         const unsubScore = scoreDocRef.onSnapshot((snap) => {
-          if (snap.exists) {
-            const remoteHigh = snap.data().highScore || 0;
-            setHighScore(prev => Math.max(prev, remoteHigh));
-          }
+          if (snap.exists) setHighScore(prev => Math.max(prev, snap.data().highScore || 0));
         });
 
         const historyColRef = db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('history');
@@ -264,7 +269,6 @@
           try {
             const historyColRef = db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('history');
             await historyColRef.add({ score: finalScore, timestamp: firebase.firestore.FieldValue.serverTimestamp() });
-
             if (finalScore > highScoreRef.current) {
               const scoreDocRef = db.collection('artifacts').doc(appId).collection('users').doc(user.uid).collection('stats').doc('overall');
               await scoreDocRef.set({ highScore: finalScore }, { merge: true });
@@ -278,30 +282,41 @@
         return [...LEVELS].reverse().find(l => score >= l.min) || LEVELS[0];
       }, [score]);
 
-      const spawnTapEffect = useCallback((x, y) => {
-        const pCount = Math.min(4 + Math.floor(score / 80), 16);
+      const spawnParticles = useCallback((x, y, scoreBase, level) => {
+        const pCount = Math.min(4 + Math.floor(scoreBase / 80), 12);
         const newParticles = Array.from({ length: pCount }).map(() => ({
           id: Math.random(),
           x, y,
-          vx: (Math.random() - 0.5) * (25 + score / 15),
-          vy: (Math.random() - 0.5) * (25 + score / 15),
-          color: currentLevel.ultimate ? `hsl(${Math.random() * 60 + 40}, 100%, 70%)` : `hsl(${180 + (score % 180)}, 100%, 65%)`,
+          vx: (Math.random() - 0.5) * (25 + scoreBase / 15),
+          vy: (Math.random() - 0.5) * (25 + scoreBase / 15),
+          color: level.ultimate ? `hsl(${Math.random() * 60 + 40}, 100%, 70%)` : `hsl(${180 + (scoreBase % 180)}, 100%, 65%)`,
           size: Math.random() * 12 + 2
         }));
-        setParticles(p => [...p.slice(-60), ...newParticles]);
-      }, [score, currentLevel]);
+        setParticles(p => [...p.slice(-36), ...newParticles]);
+
+        if (particleCleanupRef.current) clearTimeout(particleCleanupRef.current);
+        particleCleanupRef.current = setTimeout(() => {
+          setParticles(p => p.slice(-36));
+        }, 850);
+      }, []);
 
       const registerTapAtPoint = useCallback((x, y) => {
         if (gameState !== 'playing') return;
-        const now = Date.now();
+
+        const scoreBase = scoreRef.current;
+        const level = [...LEVELS].reverse().find(l => scoreBase >= l.min) || LEVELS[0];
+
         setScore(s => s + 1);
-        setCombo(prev => (now - lastTapTime < 250 ? prev + 1 : 1));
-        setLastTapTime(now);
-        spawnTapEffect(x, y);
-      }, [gameState, lastTapTime, spawnTapEffect]);
+        const now = performance.now();
+        setCombo(prev => (now - lastTapTimeRef.current < 250 ? prev + 1 : 1));
+        lastTapTimeRef.current = now;
+
+        spawnParticles(x, y, scoreBase, level);
+      }, [gameState, spawnParticles]);
 
       const onTap = useCallback((e) => {
         if (gameState !== 'playing') return;
+        if (touchHandledRef.current) return;
         if (e.cancelable) e.preventDefault();
 
         const rect = e.currentTarget.getBoundingClientRect();
@@ -314,6 +329,7 @@
         if (gameState !== 'playing') return;
         if (e.cancelable) e.preventDefault();
 
+        touchHandledRef.current = true;
         for (const touch of Array.from(e.changedTouches || [])) {
           if (activeTouchIdsRef.current.has(touch.identifier)) continue;
           activeTouchIdsRef.current.add(touch.identifier);
@@ -325,38 +341,46 @@
         for (const touch of Array.from(e.changedTouches || [])) {
           activeTouchIdsRef.current.delete(touch.identifier);
         }
+        if (activeTouchIdsRef.current.size === 0) touchHandledRef.current = false;
       }, []);
 
       const onTouchCancelTap = useCallback((e) => {
         for (const touch of Array.from(e.changedTouches || [])) {
           activeTouchIdsRef.current.delete(touch.identifier);
         }
+        if (activeTouchIdsRef.current.size === 0) touchHandledRef.current = false;
+      }, []);
+
+      const resetInteractiveState = useCallback(() => {
+        activeTouchIdsRef.current.clear();
+        touchHandledRef.current = false;
+        lastTapTimeRef.current = 0;
+        setCombo(0);
       }, []);
 
       const shake = gameState === 'playing' ? Math.min(combo / 6, 12) : 0;
 
       return (
         <div className={`fixed inset-0 text-white font-sans flex flex-col items-center justify-between overflow-hidden select-none touch-none bg-black transition-colors duration-700`}
-            style={{ backgroundColor: gameState === 'playing' ? currentLevel.theme : 'black' }}>
+             style={{ backgroundColor: gameState === 'playing' ? currentLevel.theme : 'black' }}>
 
           {/* Dynamic Background FX */}
           <div className="absolute inset-0 pointer-events-none transition-opacity duration-1000"
-              style={{ 
-                opacity: gameState === 'playing' ? 0.3 : 0.1,
-                background: `radial-gradient(circle at center, ${currentLevel.ultimate ? '#fff' : '#0ea5e9'} 0%, transparent 80%)`,
-                filter: `hue-rotate(${score * 0.5}deg)`
-              }} />
+               style={{ 
+                 opacity: gameState === 'playing' ? 0.3 : 0.1,
+                 background: `radial-gradient(circle at center, ${currentLevel.ultimate ? '#fff' : '#0ea5e9'} 0%, transparent 80%)`,
+                 filter: `hue-rotate(${score * 0.5}deg)`
+               }} />
 
           {/* Shake Container */}
           <div className="w-full h-full flex flex-col items-center justify-between p-6 z-10"
-              style={{ transform: `translate(${(Math.random()-0.5)*shake}px, ${(Math.random()-0.5)*shake}px)` }}>
+               style={{ transform: `translate(${(Math.random()-0.5)*shake}px, ${(Math.random()-0.5)*shake}px)` }}>
 
             {/* Top HUD */}
             <div className="w-full flex justify-between items-start pt-4">
               <div className="flex flex-col">
                 <span className="text-[10px] font-black tracking-widest text-white/30 uppercase">TIME LIMIT</span>
-                <span className={`text-6xl font-black font-mono leading-none ${timeLeft < 5 ? 'text-red-500 italic animate-pulse' : 'text-white'}`}
-                      style={{ textShadow: 'none', WebkitTextStroke: '0 transparent', backfaceVisibility: 'hidden', WebkitFontSmoothing: 'antialiased' }}>
+                <span className={`text-6xl font-black font-mono leading-none ${timeLeft < 5 ? 'text-red-500 italic animate-pulse' : 'text-white'}`}>
                   {smoothTime}
                 </span>
               </div>
@@ -371,7 +395,7 @@
 
             {/* Level Banner */}
             <div className={`px-10 py-3 rounded-full border-4 border-current font-black text-2xl italic tracking-tighter uppercase transition-all duration-500 ${currentLevel.color} bg-black/60 backdrop-blur-xl`}
-                style={{ boxShadow: currentLevel.glow, transform: `scale(${1 + (score/1000)})` }}>
+                 style={{ boxShadow: currentLevel.glow, transform: `scale(${1 + (score/1000)})` }}>
               {currentLevel.label}
             </div>
 
@@ -384,8 +408,14 @@
                       TAP<br/><span className="text-white drop-shadow-[0_0_30px_white] text-9xl">OVERDRIVE</span>
                     </h1>
                   </div>
-                  <button onPointerDown={() => { setScore(0); setTimeLeft(30.0); setGameState('counting'); }} 
-                          className="bg-white text-black font-black py-8 px-24 rounded-3xl text-4xl shadow-[0_0_60px_rgba(255,255,255,0.4)] active:scale-95 transition-all">
+                  <button
+                    onPointerDown={() => {
+                      resetInteractiveState();
+                      setScore(0);
+                      setTimeLeft(30.0);
+                      setGameState('counting');
+                    }} 
+                    className="bg-white text-black font-black py-8 px-24 rounded-3xl text-4xl shadow-[0_0_60px_rgba(255,255,255,0.4)] active:scale-95 transition-all">
                     START
                   </button>
                   <button onClick={() => setShowHistory(true)} className="text-white/20 font-black text-xs tracking-widest hover:text-white transition-colors">
@@ -401,12 +431,13 @@
               )}
 
               {gameState === 'playing' && (
-                <div onPointerDown={onTap}
-                    onTouchStart={onTouchStartTap}
-                    onTouchEnd={onTouchEndTap}
-                    onTouchCancel={onTouchCancelTap}
-                    className="w-[88vw] h-[88vw] max-w-[400px] max-h-[400px] rounded-full border-[20px] border-white/10 flex items-center justify-center transition-all active:scale-90 bg-zinc-900/50 backdrop-blur-sm relative"
-                    style={{ touchAction: 'none' }}>
+                <div
+                  onPointerDown={onTap}
+                  onTouchStart={onTouchStartTap}
+                  onTouchEnd={onTouchEndTap}
+                  onTouchCancel={onTouchCancelTap}
+                  className="w-[88vw] h-[88vw] max-w-[400px] max-h-[400px] rounded-full border-[20px] border-white/10 flex items-center justify-center transition-all active:scale-90 bg-zinc-900/50 backdrop-blur-sm relative"
+                  style={{ touchAction: 'none' }}>
                   <div className={`absolute inset-0 rounded-full border-4 border-white/5 ${score > 400 ? 'animate-spin-fast' : 'animate-spin-slow'}`} />
                   <p className="text-9xl font-black italic tracking-tighter text-white drop-shadow-2xl">TAP!</p>
                 </div>
@@ -419,8 +450,8 @@
           {/* Particle System */}
           {particles.map(p => (
             <div key={p.id} className="fixed rounded-full pointer-events-none z-50 animate-out-ultra"
-                style={{ left: p.x, top: p.y, width: p.size, height: p.size, backgroundColor: p.color, 
-                        boxShadow: `0 0 20px ${p.color}`, transform: `translate(${p.vx}px, ${p.vy}px)` }} />
+                 style={{ left: p.x, top: p.y, width: p.size, height: p.size, backgroundColor: p.color, 
+                          boxShadow: `0 0 20px ${p.color}`, transform: `translate(${p.vx * 15}px, ${p.vy * 15}px)` }} />
           ))}
 
           {/* Result Modal - Ultimate 3D Score Display */}
@@ -437,12 +468,18 @@
               </div>
 
               <div className={`px-14 py-5 rounded-2xl ${currentLevel.bg} text-black font-black text-4xl italic mb-14 shadow-2xl skew-x-[-10deg]`}
-                  style={{ boxShadow: currentLevel.glow }}>
+                   style={{ boxShadow: currentLevel.glow }}>
                 {currentLevel.label}
               </div>
 
-              <button disabled={isLocked} onPointerDown={() => !isLocked && setGameState('idle')}
-                      className={`w-full max-w-sm py-8 rounded-[2.5rem] font-black text-3xl transition-all ${isLocked ? 'bg-zinc-800 text-zinc-600' : 'bg-white text-black active:scale-95 shadow-[0_0_50px_rgba(255,255,255,0.3)]'}`}>
+              <button
+                disabled={isLocked}
+                onPointerDown={() => {
+                  if (isLocked) return;
+                  resetInteractiveState();
+                  setGameState('idle');
+                }}
+                className={`w-full max-w-sm py-8 rounded-[2.5rem] font-black text-3xl transition-all ${isLocked ? 'bg-zinc-800 text-zinc-600' : 'bg-white text-black active:scale-95 shadow-[0_0_50px_rgba(255,255,255,0.3)]'}`}>
                 {isLocked ? "SAVING RECORD..." : "TRY AGAIN"}
               </button>
             </div>
@@ -462,7 +499,7 @@
                   const hLevel = [...LEVELS].reverse().find(l => h.score >= l.min) || LEVELS[0];
                   return (
                     <div key={h.id || i} className="flex justify-between items-center bg-zinc-900/50 p-7 rounded-[2rem] border-l-[15px] border-white/5 transition-all"
-                        style={{ borderColor: hLevel.ultimate ? 'gold' : 'rgba(255,255,255,0.1)' }}>
+                         style={{ borderColor: hLevel.ultimate ? 'gold' : 'rgba(255,255,255,0.1)' }}>
                       <div>
                         <p className="text-5xl font-black font-mono leading-none">{h.score}</p>
                         <p className="text-[10px] text-white/30 font-bold uppercase mt-2">
@@ -478,9 +515,15 @@
               </div>
               <div className="pt-4 flex gap-4">
                 <button
-                  onPointerDown={() => { setShowHistory(false); setScore(0); setTimeLeft(30.0); setCountdown(3); setGameState('idle'); }}
-                  className="flex-1 bg-white text-black font-black py-6 rounded-[2rem] text-2xl active:scale-95 transition-all shadow-[0_0_50px_rgba(255,255,255,0.3)]"
-                >
+                  onPointerDown={() => {
+                    resetInteractiveState();
+                    setShowHistory(false);
+                    setScore(0);
+                    setTimeLeft(30.0);
+                    setCountdown(3);
+                    setGameState('idle');
+                  }}
+                  className="flex-1 bg-white text-black font-black py-6 rounded-[2rem] text-2xl active:scale-95 transition-all shadow-[0_0_50px_rgba(255,255,255,0.3)]">
                   RESTART
                 </button>
               </div>
